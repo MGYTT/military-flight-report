@@ -1,0 +1,84 @@
+name: Daily Polish Military Flight Report
+
+on:
+  schedule:
+    # GitHub Actions cron działa wyłącznie w UTC.
+    # Uruchamiamy o 05:00 UTC, a skrypt wykona analizę tylko wtedy,
+    # gdy w Polsce jest 07:00 (obsługa CET/CEST znajduje się w Pythonie).
+    - cron: "0 5 * * *"
+
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Wymuś uruchomienie niezależnie od lokalnej godziny 07:00"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-military-report
+  cancel-in-progress: false
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      TZ: Europe/Warsaw
+      REPORT_OUTPUT_DIR: reports
+      # Opcjonalnie ustaw własne repo archiwum:
+      # ADSB_HISTORY_REPO: adsblol/globe_history_2026
+      ADSB_HISTORY_TOKEN: ${{ secrets.ADSB_HISTORY_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas
+
+      - name: Generate daily report
+        env:
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force_run && '1' || '' }}
+        run: |
+          python daily_military_report.py
+
+      - name: Show generated report
+        run: |
+          echo "Generated reports:"
+          ls -lah reports || true
+          latest_report="$(ls -t reports/raport-*.md 2>/dev/null | head -n 1 || true)"
+          if [ -n "$latest_report" ]; then
+            echo "----- $latest_report -----"
+            cat "$latest_report"
+          fi
+
+      - name: Commit and push report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add reports/raport-*.md
+
+          if git diff --cached --quiet; then
+            echo "No report changes to commit."
+            exit 0
+          fi
+
+          report_date="$(TZ=Europe/Warsaw date -d 'yesterday' +%F)"
+          git commit -m "chore: military flight report ${report_date}"
+          git push
