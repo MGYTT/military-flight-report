@@ -1,42 +1,35 @@
-name: Daily Polish Military Flight Report
+name: Live Military Flight Collector
 
 on:
   schedule:
-    # GitHub Actions cron działa wyłącznie w UTC.
-    # Uruchamiamy o 05:00 UTC, a skrypt wykona analizę tylko wtedy,
-    # gdy w Polsce jest 07:00 (obsługa CET/CEST znajduje się w Pythonie).
-    - cron: "0 5 * * *"
+    # Co 5 minut. Strefa Europe/Warsaw uwzględnia CET/CEST.
+    - cron: "*/5 * * * *"
+      timezone: "Europe/Warsaw"
 
   workflow_dispatch:
-    inputs:
-      force_run:
-        description: "Wymuś uruchomienie niezależnie od lokalnej godziny 07:00"
-        required: false
-        default: true
-        type: boolean
 
 permissions:
   contents: write
 
 concurrency:
-  group: daily-military-report
+  group: live-military-flight-collector
   cancel-in-progress: false
 
 jobs:
-  generate-report:
+  collect-and-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
 
     env:
       TZ: Europe/Warsaw
-      REPORT_OUTPUT_DIR: reports
-      # Opcjonalnie ustaw własne repo archiwum:
-      # ADSB_HISTORY_REPO: adsblol/globe_history_2026
-      ADSB_HISTORY_TOKEN: ${{ secrets.ADSB_HISTORY_TOKEN }}
+      DATABASE_PATH: data/military_flights.sqlite3
+      REPORTS_DIR: reports/hourly
+      ADSB_API_URL: https://api.adsb.lol/v2/bbox/48.70/55.20/13.70/24.40
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -52,34 +45,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Generate daily report
-        env:
-          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force_run && '1' || '' }}
+      - name: Collect ADS-B snapshot and generate hourly report
         run: |
-          python daily_military_report.py
+          python live_military_collector.py
 
-      - name: Show generated report
-        run: |
-          echo "Generated reports:"
-          ls -lah reports || true
-          latest_report="$(ls -t reports/raport-*.md 2>/dev/null | head -n 1 || true)"
-          if [ -n "$latest_report" ]; then
-            echo "----- $latest_report -----"
-            cat "$latest_report"
-          fi
-
-      - name: Commit and push report
+      - name: Commit database and reports
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add reports/raport-*.md
+          git add data/military_flights.sqlite3 reports/hourly/
 
           if git diff --cached --quiet; then
-            echo "No report changes to commit."
+            echo "No changes to commit."
             exit 0
           fi
 
-          report_date="$(TZ=Europe/Warsaw date -d 'yesterday' +%F)"
-          git commit -m "chore: military flight report ${report_date}"
+          git commit -m "chore: collect ADS-B snapshot $(TZ=Europe/Warsaw date '+%F %H:%M')"
+          git pull --rebase origin "${{ github.ref_name }}"
           git push
