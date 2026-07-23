@@ -3,33 +3,39 @@
 live_military_collector.py
 ==========================
 
-Monitoring publicznie widocznych lotów wojskowych nad Polską.
+Military Flight Report Poland — wersja produkcyjna v1.
 
-Źródło danych:
-- ADSB.lol /v2/mil: globalna lista samolotów sklasyfikowanych jako military.
+Monitoruje publicznie widoczne dane ADS-B/MLAT lotów wojskowych nad Polską.
 
-Proces:
-1. Pobiera aktualny snapshot ADS-B.
-2. Akceptuje wyłącznie aktualne pozycje wewnątrz wielokąta Polski.
-3. Zapisuje zweryfikowane obserwacje do SQLite.
-4. Generuje raporty Markdown za każdą zakończoną godzinę.
-5. Wysyła Discord embed oraz plik raportu .md jako załącznik.
-6. Chroni przed duplikatami, błędnymi danymi i opóźnieniami GitHub Actions.
+Najważniejsze właściwości:
+- źródło: ADSB.lol /v2/mil;
+- filtr pozycji: bbox + wielokąt Polski, nie sam prostokąt;
+- filtr jakości: aktualna pozycja, ICAO Hex, wysokość;
+- SQLite: obserwacje, raporty oraz cache tras;
+- raport za każdą zamkniętą godzinę, także po opóźnieniu GitHub Actions;
+- format do publikowania w social media;
+- kierunek lotu, czas widoczności, max wysokość i prędkość;
+- opcjonalny route lookup przez ADSBDB z cache;
+- Discord embed i kompletny raport Markdown jako załącznik;
+- bez wymyślania startu/przylotu — trasa zawsze ma status pewności.
 
 Wymagania:
     pip install requests pandas
 
 Zmienne środowiskowe:
-    ADSB_API_URL              default: https://api.adsb.lol/v2/mil
-    DATABASE_PATH             default: data/military_flights.sqlite3
-    REPORTS_DIR               default: reports/hourly
-    DISCORD_WEBHOOK_URL       GitHub Secret, opcjonalny
-    RETENTION_DAYS            default: 14
-    MAX_SEEN_SECONDS          default: 120
-    MIN_ALTITUDE_FT           default: 0
-    MIN_SAMPLES_PER_FLIGHT    default: 1
-    BACKFILL_HOURS            default: 2
-    DISCORD_SEND_EMPTY        default: 0
+    ADSB_API_URL                 default: https://api.adsb.lol/v2/mil
+    DATABASE_PATH                default: data/military_flights.sqlite3
+    REPORTS_DIR                  default: reports/hourly
+    DISCORD_WEBHOOK_URL          opcjonalny GitHub Secret
+    RETENTION_DAYS               default: 14
+    MAX_SEEN_SECONDS             default: 120
+    MIN_ALTITUDE_FT              default: 0
+    MIN_SAMPLES_PER_FLIGHT       default: 1
+    BACKFILL_HOURS               default: 2
+    DISCORD_SEND_EMPTY           default: 0
+    ENABLE_ROUTE_LOOKUP          default: 0
+    ROUTE_CACHE_HOURS            default: 12
+    ADSBDB_ROUTE_URL_TEMPLATE    default: https://api.adsbdb.com/v0/callsign/{callsign}
 """
 
 from __future__ import annotations
@@ -68,12 +74,8 @@ DATABASE_PATH = Path(
     os.getenv("DATABASE_PATH", "data/military_flights.sqlite3")
 )
 REPORTS_DIR = Path(os.getenv("REPORTS_DIR", "reports/hourly"))
+
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-
-REQUEST_TIMEOUT_SECONDS = 30
-MAX_RETRIES = 3
-RETRY_WAIT_SECONDS = 5
-
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "14"))
 MAX_SEEN_SECONDS = int(os.getenv("MAX_SEEN_SECONDS", "120"))
 MIN_ALTITUDE_FT = int(os.getenv("MIN_ALTITUDE_FT", "0"))
@@ -85,7 +87,22 @@ DISCORD_SEND_EMPTY = os.getenv(
     "0",
 ).strip().lower() in {"1", "true", "yes"}
 
-# Wstępne odrzucenie punktów daleko od Polski.
+ENABLE_ROUTE_LOOKUP = os.getenv(
+    "ENABLE_ROUTE_LOOKUP",
+    "0",
+).strip().lower() in {"1", "true", "yes"}
+
+ROUTE_CACHE_HOURS = int(os.getenv("ROUTE_CACHE_HOURS", "12"))
+ADSBDB_ROUTE_URL_TEMPLATE = os.getenv(
+    "ADSBDB_ROUTE_URL_TEMPLATE",
+    "https://api.adsbdb.com/v0/callsign/{callsign}",
+).strip()
+
+REQUEST_TIMEOUT_SECONDS = 30
+MAX_RETRIES = 3
+RETRY_WAIT_SECONDS = 5
+
+# Szybki filtr obszaru otaczającego Polskę.
 POLAND_BOUNDS = {
     "lat_min": 48.70,
     "lat_max": 55.20,
@@ -93,9 +110,8 @@ POLAND_BOUNDS = {
     "lon_max": 24.40,
 }
 
-# Uproszczony wielokąt Polski, format: (longitude, latitude).
-# Został użyty zamiast samego bbox, który obejmował także terytorium
-# państw sąsiednich i powodował fałszywe wpisy w raportach.
+# Uproszczony wielokąt granic Polski — format (longitude, latitude).
+# Jest stosowany po bbox, żeby nie raportować samolotów z państw sąsiednich.
 POLAND_POLYGON: tuple[tuple[float, float], ...] = (
     (14.12, 53.92),
     (14.32, 54.18),
@@ -176,11 +192,11 @@ MILITARY_CALLSIGN_PATTERN = re.compile(
     r"HAWK|RAVEN|COBRA)[A-Z0-9-]*$"
 )
 
-log = logging.getLogger("live-military-collector")
+log = logging.getLogger("military-flight-report")
 
 
 # =============================================================================
-# Modele i narzędzia
+# Modele
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -191,10 +207,21 @@ class Classification:
 
 
 @dataclass(frozen=True)
-class ObservationDecision:
+class ValidationResult:
     accepted: bool
     reason: str
 
+
+@dataclass(frozen=True)
+class RouteInfo:
+    route: str
+    confidence: str
+    source: str
+
+
+# =============================================================================
+# Narzędzia
+# =============================================================================
 
 def configure_logging() -> None:
     logging.basicConfig(
@@ -226,12 +253,17 @@ def markdown_safe(value: Any) -> str:
     return str(value or "").replace("|", "\\|").replace("\n", " ").strip()
 
 
+def bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "1" if default else "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def point_in_polygon(
     latitude: float,
     longitude: float,
     polygon: tuple[tuple[float, float], ...],
 ) -> bool:
-    """Ray-casting dla punktu (lat, lon) i polygonu (lon, lat)."""
+    """Ray-casting; polygon używa kolejności (lon, lat)."""
     inside = False
     previous_lon, previous_lat = polygon[-1]
 
@@ -255,7 +287,6 @@ def point_in_polygon(
 
 
 def is_over_poland(aircraft: dict[str, Any]) -> bool:
-    """Dokładny filtr: bbox + wielokąt granic Polski."""
     latitude = safe_float(aircraft.get("lat"))
     longitude = safe_float(aircraft.get("lon"))
 
@@ -275,63 +306,57 @@ def is_over_poland(aircraft: dict[str, Any]) -> bool:
     )
 
 
-def validate_observation(aircraft: dict[str, Any]) -> ObservationDecision:
-    """
-    Jedno miejsce dla reguł jakości danych.
-
-    Odrzuca wpis bez pozycji, poza Polską, z przeterminowaną pozycją
-    lub z jednoznacznie zbyt niską wysokością.
-    """
+def validate_aircraft(aircraft: dict[str, Any]) -> ValidationResult:
+    """Pojedyncze źródło reguł jakości danych."""
     if not is_over_poland(aircraft):
-        return ObservationDecision(False, "poza granicami Polski")
+        return ValidationResult(False, "poza granicami Polski")
 
     seen_pos = safe_float(aircraft.get("seen_pos"))
     if seen_pos is not None and seen_pos > MAX_SEEN_SECONDS:
-        return ObservationDecision(False, "pozycja zbyt stara")
+        return ValidationResult(False, "pozycja zbyt stara")
 
     altitude_ft = safe_float(
         aircraft.get("alt_baro") or aircraft.get("alt_geom")
     )
-
     if altitude_ft is not None and altitude_ft < MIN_ALTITUDE_FT:
-        return ObservationDecision(False, "wysokość poniżej progu")
+        return ValidationResult(False, "wysokość poniżej progu")
 
-    hex_code = normalized(aircraft.get("hex"))
-    if not re.fullmatch(r"[0-9A-F]{6}", hex_code.replace("~", "")):
-        return ObservationDecision(False, "brak prawidłowego ICAO Hex")
+    hex_code = normalized(aircraft.get("hex")).replace("~", "")
+    if not re.fullmatch(r"[0-9A-F]{6}", hex_code):
+        return ValidationResult(False, "nieprawidłowy ICAO Hex")
 
-    return ObservationDecision(True, "zaakceptowano")
+    return ValidationResult(True, "zaakceptowano")
 
 
 def classify_aircraft(aircraft: dict[str, Any]) -> Classification:
     """
-    Endpoint /v2/mil jest pierwszym poziomem klasyfikacji.
-    Typ i callsign służą do poprawnego opisu oraz poziomu pewności.
+    /v2/mil jest podstawą kwalifikacji.
+    Callsign, typ i dbFlags podnoszą pewność opisową.
     """
     callsign = normalized(aircraft.get("flight") or aircraft.get("callsign"))
     aircraft_type = normalized(aircraft.get("t") or aircraft.get("type"))
 
-    reasons = ["źródło API: /v2/mil"]
     type_label = aircraft_type or "Nieznany typ"
     confidence = "średnia"
+    reasons = ["źródło API: /v2/mil"]
 
     if callsign and MILITARY_CALLSIGN_PATTERN.match(callsign):
-        reasons.append(f"callsign wojskowy: {callsign}")
         confidence = "wysoka"
+        reasons.append(f"callsign wojskowy: {callsign}")
 
-    for pattern, label in MILITARY_TYPE_PATTERNS:
+    for pattern, readable_type in MILITARY_TYPE_PATTERNS:
         if aircraft_type and re.search(pattern, aircraft_type):
-            type_label = label
-            reasons.append(f"typ ICAO: {aircraft_type}")
+            type_label = readable_type
             confidence = "wysoka"
+            reasons.append(f"typ ICAO: {aircraft_type}")
             break
 
     db_flags = safe_int(
         aircraft.get("dbFlags", aircraft.get("dbflags", 0))
     )
     if db_flags is not None and db_flags & 1:
-        reasons.append("dbFlags: military")
         confidence = "wysoka"
+        reasons.append("dbFlags: military")
 
     return Classification(
         type_label=type_label,
@@ -340,8 +365,87 @@ def classify_aircraft(aircraft: dict[str, Any]) -> Classification:
     )
 
 
+def haversine_km(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+) -> float:
+    radius_km = 6371.0
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(d_lon / 2) ** 2
+    )
+    return 2 * radius_km * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def bearing_degrees(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+) -> float:
+    """Początkowy bearing od punktu 1 do punktu 2."""
+    lon_delta = math.radians(lon2 - lon1)
+
+    y = math.sin(lon_delta) * math.cos(math.radians(lat2))
+    x = (
+        math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
+        - math.sin(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.cos(lon_delta)
+    )
+
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def cardinal_direction(bearing: float) -> str:
+    directions = (
+        "N",
+        "NE",
+        "E",
+        "SE",
+        "S",
+        "SW",
+        "W",
+        "NW",
+    )
+    return directions[int((bearing + 22.5) // 45) % 8]
+
+
+def movement_direction(
+    first_lat: Any,
+    first_lon: Any,
+    last_lat: Any,
+    last_lon: Any,
+) -> tuple[str, Optional[float]]:
+    """
+    Kierunek pokazujemy wyłącznie po realnym przesunięciu co najmniej 10 km.
+    Krążenie lub błąd GPS nie powinny tworzyć pozornej trasy.
+    """
+    lat1 = safe_float(first_lat)
+    lon1 = safe_float(first_lon)
+    lat2 = safe_float(last_lat)
+    lon2 = safe_float(last_lon)
+
+    if None in (lat1, lon1, lat2, lon2):
+        return "nieustalony", None
+
+    distance = haversine_km(lat1, lon1, lat2, lon2)
+    if distance < 10.0:
+        return "lokalny / krążenie", distance
+
+    bearing = bearing_degrees(lat1, lon1, lat2, lon2)
+    return cardinal_direction(bearing), distance
+
+
 # =============================================================================
-# API ADSB.lol
+# API
 # =============================================================================
 
 def create_session() -> requests.Session:
@@ -349,14 +453,13 @@ def create_session() -> requests.Session:
     session.headers.update(
         {
             "Accept": "application/json",
-            "User-Agent": "MGYTT-MilitaryFlightReport/7.0",
+            "User-Agent": "MGYTT-MilitaryFlightReport/8.0",
         }
     )
     return session
 
 
-def fetch_snapshot(session: requests.Session) -> list[dict[str, Any]]:
-    """Pobiera snapshot military z retry i obsługą HTTP 429/5xx."""
+def fetch_adsb_snapshot(session: requests.Session) -> list[dict[str, Any]]:
     last_error: Optional[Exception] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -367,20 +470,20 @@ def fetch_snapshot(session: requests.Session) -> list[dict[str, Any]]:
             )
 
             if response.status_code == 429 or response.status_code >= 500:
-                wait_seconds = RETRY_WAIT_SECONDS * attempt
+                wait = RETRY_WAIT_SECONDS * attempt
                 log.warning(
                     "ADSB.lol HTTP %s; ponowienie za %s s.",
                     response.status_code,
-                    wait_seconds,
+                    wait,
                 )
-                time.sleep(wait_seconds)
+                time.sleep(wait)
                 continue
 
             response.raise_for_status()
             payload = response.json()
 
             if not isinstance(payload, dict):
-                raise ValueError("Odpowiedź ADSB.lol nie jest obiektem JSON.")
+                raise ValueError("ADSB.lol zwrócił nieprawidłowy JSON.")
 
             aircraft = payload.get("ac") or payload.get("aircraft") or []
             if not isinstance(aircraft, list):
@@ -392,26 +495,22 @@ def fetch_snapshot(session: requests.Session) -> list[dict[str, Any]]:
             last_error = exc
 
             if attempt < MAX_RETRIES:
-                wait_seconds = RETRY_WAIT_SECONDS * attempt
+                wait = RETRY_WAIT_SECONDS * attempt
                 log.warning(
-                    "Błąd pobrania API: %s; ponowienie za %s s.",
+                    "Błąd ADSB.lol: %s; ponowienie za %s s.",
                     exc,
-                    wait_seconds,
+                    wait,
                 )
-                time.sleep(wait_seconds)
+                time.sleep(wait)
 
     raise RuntimeError(f"Nie udało się pobrać ADSB.lol: {last_error}")
 
 
 # =============================================================================
-# Baza danych
+# SQLite
 # =============================================================================
 
 def init_database(connection: sqlite3.Connection) -> None:
-    """
-    DELETE journal mode zapobiega problematycznym plikom WAL/SHM
-    w repozytorium GitHub.
-    """
     connection.executescript(
         """
         PRAGMA foreign_keys = ON;
@@ -453,6 +552,14 @@ def init_database(connection: sqlite3.Connection) -> None:
             observations_count INTEGER NOT NULL,
             discord_sent INTEGER NOT NULL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS route_cache (
+            callsign TEXT PRIMARY KEY,
+            route TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            source TEXT NOT NULL,
+            fetched_at_utc TEXT NOT NULL
+        );
         """
     )
     connection.commit()
@@ -467,17 +574,17 @@ def save_snapshot(
         "global": len(aircraft_list),
         "inside_poland": 0,
         "inserted": 0,
-        "outside_poland": 0,
+        "outside": 0,
         "stale": 0,
         "invalid": 0,
     }
 
     for aircraft in aircraft_list:
-        decision = validate_observation(aircraft)
+        decision = validate_aircraft(aircraft)
 
         if not decision.accepted:
             if decision.reason == "poza granicami Polski":
-                stats["outside_poland"] += 1
+                stats["outside"] += 1
             elif decision.reason == "pozycja zbyt stara":
                 stats["stale"] += 1
             else:
@@ -499,29 +606,14 @@ def save_snapshot(
             aircraft.get("t") or aircraft.get("type")
         ) or None
 
-        latitude = safe_float(aircraft.get("lat"))
-        longitude = safe_float(aircraft.get("lon"))
-
         try:
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO observations (
-                    observed_at_utc,
-                    observed_at_lt,
-                    hex,
-                    registration,
-                    callsign,
-                    aircraft_type,
-                    type_label,
-                    confidence,
-                    lat,
-                    lon,
-                    altitude_ft,
-                    groundspeed_kt,
-                    track_deg,
-                    seen_pos_seconds,
-                    classification_reasons,
-                    raw_json
+                    observed_at_utc, observed_at_lt, hex, registration,
+                    callsign, aircraft_type, type_label, confidence,
+                    lat, lon, altitude_ft, groundspeed_kt, track_deg,
+                    seen_pos_seconds, classification_reasons, raw_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -533,8 +625,8 @@ def save_snapshot(
                     aircraft_type,
                     classification.type_label,
                     classification.confidence,
-                    latitude,
-                    longitude,
+                    safe_float(aircraft.get("lat")),
+                    safe_float(aircraft.get("lon")),
                     safe_float(
                         aircraft.get("alt_baro") or aircraft.get("alt_geom")
                     ),
@@ -555,7 +647,7 @@ def save_snapshot(
 
         except (sqlite3.Error, TypeError, ValueError) as exc:
             stats["invalid"] += 1
-            log.warning("Nie zapisano obserwacji %s: %s", hex_code, exc)
+            log.warning("SQLite: nie zapisano %s: %s", hex_code, exc)
 
     connection.commit()
     return stats
@@ -563,7 +655,7 @@ def save_snapshot(
 
 def report_exists(
     connection: sqlite3.Connection,
-    hour_start_lt: datetime,
+    start_lt: datetime,
 ) -> bool:
     row = connection.execute(
         """
@@ -571,7 +663,7 @@ def report_exists(
         FROM generated_reports
         WHERE hour_start_utc = ?
         """,
-        (hour_start_lt.astimezone(UTC).isoformat(),),
+        (start_lt.astimezone(UTC).isoformat(),),
     ).fetchone()
 
     return row is not None
@@ -585,20 +677,9 @@ def get_hour_observations(
     return pd.read_sql_query(
         """
         SELECT
-            observed_at_lt,
-            hex,
-            registration,
-            callsign,
-            aircraft_type,
-            type_label,
-            confidence,
-            lat,
-            lon,
-            altitude_ft,
-            groundspeed_kt,
-            track_deg,
-            seen_pos_seconds,
-            classification_reasons
+            observed_at_lt, hex, registration, callsign, aircraft_type,
+            type_label, confidence, lat, lon, altitude_ft, groundspeed_kt,
+            track_deg, seen_pos_seconds, classification_reasons
         FROM observations
         WHERE observed_at_utc >= ?
           AND observed_at_utc < ?
@@ -623,12 +704,8 @@ def record_report(
     connection.execute(
         """
         INSERT OR REPLACE INTO generated_reports (
-            hour_start_utc,
-            report_path,
-            created_at_utc,
-            flights_count,
-            observations_count,
-            discord_sent
+            hour_start_utc, report_path, created_at_utc,
+            flights_count, observations_count, discord_sent
         ) VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
@@ -643,74 +720,222 @@ def record_report(
     connection.commit()
 
 
-def delete_old_data(connection: sqlite3.Connection) -> None:
-    observation_cutoff = datetime.now(UTC) - timedelta(days=RETENTION_DAYS)
-    report_cutoff = datetime.now(UTC) - timedelta(days=RETENTION_DAYS * 2)
+def get_cached_route(
+    connection: sqlite3.Connection,
+    callsign: str,
+) -> Optional[RouteInfo]:
+    row = connection.execute(
+        """
+        SELECT route, confidence, source, fetched_at_utc
+        FROM route_cache
+        WHERE callsign = ?
+        """,
+        (callsign,),
+    ).fetchone()
 
-    deleted_observations = connection.execute(
+    if not row:
+        return None
+
+    route, confidence, source, fetched_at_utc = row
+    fetched_at = datetime.fromisoformat(fetched_at_utc)
+
+    if datetime.now(UTC) - fetched_at > timedelta(hours=ROUTE_CACHE_HOURS):
+        return None
+
+    return RouteInfo(
+        route=route,
+        confidence=confidence,
+        source=source,
+    )
+
+
+def cache_route(
+    connection: sqlite3.Connection,
+    callsign: str,
+    route: RouteInfo,
+) -> None:
+    connection.execute(
+        """
+        INSERT OR REPLACE INTO route_cache (
+            callsign, route, confidence, source, fetched_at_utc
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            callsign,
+            route.route,
+            route.confidence,
+            route.source,
+            datetime.now(UTC).isoformat(),
+        ),
+    )
+    connection.commit()
+
+
+def delete_old_data(connection: sqlite3.Connection) -> None:
+    observations_cutoff = datetime.now(UTC) - timedelta(days=RETENTION_DAYS)
+    reports_cutoff = datetime.now(UTC) - timedelta(days=RETENTION_DAYS * 2)
+    routes_cutoff = datetime.now(UTC) - timedelta(days=ROUTE_CACHE_HOURS * 3)
+
+    deleted = connection.execute(
         "DELETE FROM observations WHERE observed_at_utc < ?",
-        (observation_cutoff.isoformat(),),
+        (observations_cutoff.isoformat(),),
     ).rowcount
 
     connection.execute(
         "DELETE FROM generated_reports WHERE created_at_utc < ?",
-        (report_cutoff.isoformat(),),
+        (reports_cutoff.isoformat(),),
+    )
+
+    connection.execute(
+        "DELETE FROM route_cache WHERE fetched_at_utc < ?",
+        (routes_cutoff.isoformat(),),
     )
 
     connection.commit()
 
-    if deleted_observations:
-        log.info(
-            "Retencja: usunięto %s obserwacji starszych niż %s dni.",
-            deleted_observations,
-            RETENTION_DAYS,
+    if deleted:
+        log.info("Retencja: usunięto %s starych obserwacji.", deleted)
+
+
+# =============================================================================
+# Route lookup
+# =============================================================================
+
+def extract_airport_code(data: Any) -> Optional[str]:
+    """
+    Próbuje wydobyć ICAO/IATA z różnych możliwych struktur JSON.
+    Nie zakłada jednego sztywnego formatu zewnętrznego API.
+    """
+    if isinstance(data, str):
+        value = data.strip().upper()
+        return value if re.fullmatch(r"[A-Z0-9]{3,4}", value) else None
+
+    if not isinstance(data, dict):
+        return None
+
+    for key in ("icao_code", "icao", "iata_code", "iata", "code"):
+        value = extract_airport_code(data.get(key))
+        if value:
+            return value
+
+    return None
+
+
+def lookup_route(
+    connection: sqlite3.Connection,
+    session: requests.Session,
+    callsign: str,
+) -> RouteInfo:
+    """
+    Opcjonalna, ostrożna trasa po callsignie.
+
+    W razie braku danych zwraca 'nieustalona'. Nie stosuje heurystyki
+    „blisko lotniska = lot z lotniska”.
+    """
+    if not callsign or callsign == "BRAK":
+        return RouteInfo("nieustalona", "brak danych", "brak callsignu")
+
+    cached = get_cached_route(connection, callsign)
+    if cached:
+        return cached
+
+    if not ENABLE_ROUTE_LOOKUP:
+        return RouteInfo(
+            "nieustalona",
+            "brak danych",
+            "route lookup wyłączony",
         )
 
+    url = ADSBDB_ROUTE_URL_TEMPLATE.format(callsign=callsign)
+
+    try:
+        response = session.get(url, timeout=15)
+
+        if response.status_code == 404:
+            result = RouteInfo(
+                "nieustalona",
+                "brak danych",
+                "ADSBDB",
+            )
+            cache_route(connection, callsign, result)
+            return result
+
+        response.raise_for_status()
+        payload = response.json()
+
+        route_data = (
+            payload.get("response", {}).get("flightroute")
+            or payload.get("flightroute")
+            or payload.get("route")
+            or {}
+        )
+
+        origin = extract_airport_code(
+            route_data.get("origin")
+            or route_data.get("departure")
+        )
+        destination = extract_airport_code(
+            route_data.get("destination")
+            or route_data.get("arrival")
+        )
+
+        if origin and destination:
+            result = RouteInfo(
+                f"{origin} → {destination}",
+                "prawdopodobna",
+                "ADSBDB callsign lookup",
+            )
+        else:
+            result = RouteInfo(
+                "nieustalona",
+                "brak danych",
+                "ADSBDB",
+            )
+
+    except (requests.RequestException, ValueError, AttributeError) as exc:
+        log.warning("Route lookup dla %s nieudany: %s", callsign, exc)
+        result = RouteInfo(
+            "nieustalona",
+            "brak danych",
+            "błąd route lookup",
+        )
+
+    cache_route(connection, callsign, result)
+    return result
+
 
 # =============================================================================
-# Agregacja i raport Markdown
+# Agregacja
 # =============================================================================
-
-def last_closed_hour(now_lt: datetime) -> tuple[datetime, datetime]:
-    end_lt = now_lt.replace(minute=0, second=0, microsecond=0)
-    return end_lt - timedelta(hours=1), end_lt
-
 
 def pending_report_hours(
     connection: sqlite3.Connection,
     now_lt: datetime,
 ) -> Iterable[tuple[datetime, datetime]]:
     """
-    Zwraca zakończone godziny bez raportu z ograniczeniem BACKFILL_HOURS.
-
-    Jeśli GitHub Actions opóźni run, następny run nadrobi maksymalnie
-    kilka ostatnich godzin, zamiast utracić raport.
+    Wykrywa brakujące, zakończone godziny. Raporty są ograniczone
+    do BACKFILL_HOURS, aby pojedynczy run nie generował setek pustych plików.
     """
-    current_hour_start = now_lt.replace(
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
+    hour_start = now_lt.replace(minute=0, second=0, microsecond=0)
 
     for offset in range(BACKFILL_HOURS, 0, -1):
-        start_lt = current_hour_start - timedelta(hours=offset)
+        start_lt = hour_start - timedelta(hours=offset)
         end_lt = start_lt + timedelta(hours=1)
 
         if not report_exists(connection, start_lt):
             yield start_lt, end_lt
 
 
-def aggregate_flights(observations: pd.DataFrame) -> pd.DataFrame:
-    """
-    Łączy próbki po ICAO Hex + callsignie.
-
-    Pierwsza i ostatnia obserwacja mówią jedynie, kiedy system widział
-    obiekt nad Polską — nie są czasem startu, lądowania ani wejścia w FIR.
-    """
+def aggregate_flights(
+    observations: pd.DataFrame,
+    connection: sqlite3.Connection,
+    session: requests.Session,
+) -> pd.DataFrame:
     if observations.empty:
         return pd.DataFrame()
 
     data = observations.copy()
+
     data["observed_at_lt"] = pd.to_datetime(data["observed_at_lt"])
     data["hex"] = data["hex"].fillna("NIEZNANY")
     data["callsign"] = data["callsign"].fillna("BRAK")
@@ -732,6 +957,29 @@ def aggregate_flights(observations: pd.DataFrame) -> pd.DataFrame:
         first = group.iloc[0]
         last = group.iloc[-1]
 
+        direction, distance = movement_direction(
+            first["lat"],
+            first["lon"],
+            last["lat"],
+            last["lon"],
+        )
+
+        duration_minutes = int(
+            max(
+                0,
+                (
+                    last["observed_at_lt"] - first["observed_at_lt"]
+                ).total_seconds()
+                / 60,
+            )
+        )
+
+        route_info = lookup_route(
+            connection=connection,
+            session=session,
+            callsign=str(callsign),
+        )
+
         flights.append(
             {
                 "hex": str(hex_code),
@@ -741,7 +989,10 @@ def aggregate_flights(observations: pd.DataFrame) -> pd.DataFrame:
                 "confidence": first["confidence"],
                 "first_seen_lt": first["observed_at_lt"],
                 "last_seen_lt": last["observed_at_lt"],
+                "duration_minutes": duration_minutes,
                 "samples": len(group),
+                "direction": direction,
+                "distance_km": distance,
                 "max_altitude_ft": pd.to_numeric(
                     group["altitude_ft"],
                     errors="coerce",
@@ -750,6 +1001,9 @@ def aggregate_flights(observations: pd.DataFrame) -> pd.DataFrame:
                     group["groundspeed_kt"],
                     errors="coerce",
                 ).max(),
+                "route": route_info.route,
+                "route_confidence": route_info.confidence,
+                "route_source": route_info.source,
             }
         )
 
@@ -762,7 +1016,11 @@ def aggregate_flights(observations: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def format_optional_number(value: Any, suffix: str) -> str:
+# =============================================================================
+# Raport
+# =============================================================================
+
+def format_metric(value: Any, suffix: str) -> str:
     if pd.isna(value):
         return "—"
     return f"{int(round(float(value)))} {suffix}"
@@ -770,38 +1028,42 @@ def format_optional_number(value: Any, suffix: str) -> str:
 
 def social_line(flight: pd.Series) -> str:
     """
-    Linia gotowa do bezpośredniego kopiowania do Discorda/social media.
-    Nie podaje niezweryfikowanych lotnisk ani pełnej trasy.
+    Gotowy wpis social media, tylko fakty z raportu.
     """
     aircraft_type = str(flight["type_label"]).upper()
     registration = str(flight["registration"]).upper()
     callsign = str(flight["callsign"]).upper()
-    first_time = flight["first_seen_lt"].strftime("%H:%M")
-    last_time = flight["last_seen_lt"].strftime("%H:%M")
 
-    if first_time == last_time:
-        time_text = f"{first_time} LT"
-    else:
-        time_text = f"{first_time}–{last_time} LT"
+    start = flight["first_seen_lt"].strftime("%H:%M")
+    end = flight["last_seen_lt"].strftime("%H:%M")
+
+    visibility = (
+        f"{start} LT"
+        if start == end
+        else f"{start}–{end} LT"
+    )
+
+    direction = str(flight["direction"])
+    route = str(flight["route"])
 
     return (
         f'{aircraft_type} "{registration}" {callsign} | '
-        f"{time_text} | {int(flight['samples'])} prób."
+        f"{visibility} | {direction} | trasa: {route}"
     )
 
 
 def social_summary(flights: pd.DataFrame, max_lines: int) -> str:
     if flights.empty:
-        return "Brak zakwalifikowanych obserwacji."
+        return "Brak zakwalifikowanych obserwacji nad Polską."
 
     lines = [
         social_line(flight)
         for _, flight in flights.head(max_lines).iterrows()
     ]
 
-    hidden_count = len(flights) - max_lines
-    if hidden_count > 0:
-        lines.append(f"… i {hidden_count} kolejnych wpisów w załączniku.")
+    hidden = len(flights) - max_lines
+    if hidden > 0:
+        lines.append(f"… oraz {hidden} kolejnych pozycji w załączniku.")
 
     return "\n".join(lines)
 
@@ -810,38 +1072,44 @@ def build_report(
     observations: pd.DataFrame,
     start_lt: datetime,
     end_lt: datetime,
+    connection: sqlite3.Connection,
+    session: requests.Session,
 ) -> tuple[str, int, pd.DataFrame]:
-    flights = aggregate_flights(observations)
+    flights = aggregate_flights(
+        observations=observations,
+        connection=connection,
+        session=session,
+    )
 
-    report = [
+    lines = [
         f"# Loty wojskowe nad Polską — {start_lt.strftime('%d.%m.%Y')}",
         "",
         f"**Okno obserwacji:** {start_lt.strftime('%H:%M')}–{end_lt.strftime('%H:%M')} LT",
-        f"**Zapisane próbki po filtracji granic Polski:** {len(observations)}",
+        f"**Próbki po filtracji granic Polski:** {len(observations)}",
         "",
         "## Podsumowanie do publikacji",
         "",
     ]
 
     if flights.empty:
-        report.extend(
+        lines.extend(
             [
                 "```text",
                 "Brak zakwalifikowanych publicznie widocznych lotów wojskowych nad Polską.",
                 "```",
                 "",
-                "> Brak danych ADS-B/MLAT nie potwierdza braku aktywności lotniczej.",
+                "> Brak danych ADS-B/MLAT nie potwierdza braku aktywności wojskowej.",
                 "",
                 "## Metoda",
                 "",
-                "- Raport obejmuje wyłącznie obiekty z aktualną pozycją wewnątrz wielokąta granic Polski.",
-                "- Źródłem są publiczne dane ADS-B/MLAT z endpointu military.",
+                "- Ujęto wyłącznie pozycje wewnątrz wielokąta granic Polski.",
+                "- Dane pochodzą z publicznych obserwacji ADS-B/MLAT.",
                 "",
             ]
         )
-        return "\n".join(report), 0, flights
+        return "\n".join(lines), 0, flights
 
-    report.extend(
+    lines.extend(
         [
             "```text",
             social_summary(flights, max_lines=999),
@@ -849,10 +1117,10 @@ def build_report(
             "",
             "## Dane szczegółowe",
             "",
-            f"**Wykryte loty/ślady:** {len(flights)}",
+            f"**Loty/ślady:** {len(flights)}",
             "",
-            "| Typ | Rejestracja | Callsign | ICAO Hex | Widoczny nad Polską LT | Próbki | Max ALT | Max GS | Pewność |",
-            "|---|---|---|---|---|---:|---:|---:|---|",
+            "| Typ | Rejestracja | Callsign | ICAO Hex | Widoczny nad Polską | Kierunek | Trasa | Próbki | Max ALT | Max GS |",
+            "|---|---|---|---|---|---|---|---:|---:|---:|",
         ]
     )
 
@@ -862,53 +1130,71 @@ def build_report(
             f"{flight['last_seen_lt'].strftime('%H:%M')}"
         )
 
-        report.append(
+        route_text = (
+            f"{flight['route']} ({flight['route_confidence']})"
+            if flight["route"] != "nieustalona"
+            else "nieustalona"
+        )
+
+        lines.append(
             f"| {markdown_safe(flight['type_label'])} | "
             f"{markdown_safe(flight['registration'])} | "
             f"`{markdown_safe(flight['callsign'])}` | "
             f"`{markdown_safe(flight['hex'])}` | "
             f"{time_range} | "
+            f"{markdown_safe(flight['direction'])} | "
+            f"{markdown_safe(route_text)} | "
             f"{int(flight['samples'])} | "
-            f"{format_optional_number(flight['max_altitude_ft'], 'ft')} | "
-            f"{format_optional_number(flight['max_speed_kt'], 'kt')} | "
-            f"{markdown_safe(flight['confidence'])} |"
+            f"{format_metric(flight['max_altitude_ft'], 'ft')} | "
+            f"{format_metric(flight['max_speed_kt'], 'kt')} |"
         )
 
-    unknowns = flights[
-        (flights["callsign"] == "BRAK")
-        | (flights["registration"] == "NIEZNANA")
+    interesting_types = flights[
+        flights["type_label"].str.contains(
+            "KC-|A330 MRTT|E-3|E-7|P-8|C-17|C-5",
+            case=False,
+            na=False,
+            regex=True,
+        )
     ]
 
-    report.extend(
+    lines.extend(
         [
             "",
-            "## Weryfikacja ręczna",
+            "## Najciekawsze obserwacje",
             "",
         ]
     )
 
-    if unknowns.empty:
-        report.append("Brak lotów z niepełną identyfikacją.")
-    else:
-        report.append(
-            f"Obiekty z niepełną identyfikacją: {len(unknowns)}. "
-            "Wymagają ręcznej weryfikacji ICAO Hex i historii obserwacji."
+    if interesting_types.empty:
+        lines.append(
+            "Brak tankowców, samolotów wczesnego ostrzegania lub dużych transportowców w tym oknie."
         )
+    else:
+        for _, flight in interesting_types.head(5).iterrows():
+            lines.append(
+                f"- **{markdown_safe(flight['type_label'])}** "
+                f"`{markdown_safe(flight['callsign'])}` "
+                f"({markdown_safe(flight['registration'])}), "
+                f"widoczny {flight['first_seen_lt'].strftime('%H:%M')}–"
+                f"{flight['last_seen_lt'].strftime('%H:%M')} LT, "
+                f"kierunek: {markdown_safe(flight['direction'])}."
+            )
 
-    report.extend(
+    lines.extend(
         [
             "",
             "## Metoda i ograniczenia",
             "",
-            "- Do raportu trafiają tylko obserwacje, których współrzędne znajdują się wewnątrz uproszczonego wielokąta granic Polski.",
-            "- „Widoczny nad Polską” oznacza pierwszą i ostatnią próbkę z systemu, nie potwierdzony czas przekroczenia granicy.",
-            "- Raport nie wyznacza trasy, wylotu ani przylotu: z pojedynczych snapshotów nie można tego podać wiarygodnie.",
-            "- Dane ADS-B/MLAT są publiczne i niepełne; część lotów wojskowych może nie być widoczna.",
+            "- Pozycja musi znajdować się wewnątrz wielokąta granic Polski; sam bbox nie jest wystarczający.",
+            "- „Widoczny nad Polską” oznacza pierwszą i ostatnią zapisaną próbkę, nie potwierdzony czas przekroczenia granicy.",
+            "- Trasa jest podawana tylko, jeśli zewnętrzny lookup po callsignie zwróci dane; ma status „prawdopodobna”, nie potwierdzona.",
+            "- Brak wpisu nie jest dowodem braku lotu: dane ADS-B/MLAT są publiczne, niepełne i zależą od odbioru sygnału.",
             "",
         ]
     )
 
-    return "\n".join(report), len(flights), flights
+    return "\n".join(lines), len(flights), flights
 
 
 def save_report(content: str, start_lt: datetime) -> Path:
@@ -925,7 +1211,7 @@ def save_report(content: str, start_lt: datetime) -> Path:
 # Discord
 # =============================================================================
 
-def truncate_text(text: str, limit: int) -> str:
+def truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
@@ -936,28 +1222,15 @@ def send_discord_report(
     start_lt: datetime,
     end_lt: datetime,
 ) -> bool:
-    """
-    Wysyła embed i Markdown jako załącznik.
-
-    Discord ma limity: username do 80 znaków, content do 2000,
-    opis embedu do 4096, a łączna liczba znaków embedów do 6000.
-    Podgląd jest celowo ograniczony, pełna wersja trafia do .md.
-    """
     if flights.empty and not DISCORD_SEND_EMPTY:
-        log.info("Discord: pusty raport — alert wyłączony.")
+        log.info("Discord: pusty raport, alert wyłączony.")
         return False
 
     if not DISCORD_WEBHOOK_URL:
-        log.warning("Discord: brak sekretu DISCORD_WEBHOOK_URL.")
+        log.warning("Discord: brak DISCORD_WEBHOOK_URL.")
         return False
 
-    summary = social_summary(flights, max_lines=6)
-    summary = truncate_text(summary, 3500)
-
-    window = (
-        f"{start_lt.strftime('%d.%m.%Y %H:%M')}–"
-        f"{end_lt.strftime('%H:%M')} LT"
-    )
+    preview = truncate(social_summary(flights, max_lines=6), 3500)
 
     title = (
         f"✈️ Loty wojskowe nad Polską — {len(flights)}"
@@ -965,13 +1238,18 @@ def send_discord_report(
         else "✈️ Raport: brak wykrytych lotów"
     )
 
+    window = (
+        f"{start_lt.strftime('%d.%m.%Y %H:%M')}–"
+        f"{end_lt.strftime('%H:%M')} LT"
+    )
+
     payload = {
         "username": "Military Flight Report",
-        "content": "📎 Pełny raport Markdown znajduje się w załączniku.",
+        "content": "📎 Pełny raport Markdown jest dostępny w załączniku.",
         "embeds": [
             {
                 "title": title,
-                "description": f"```text\n{summary}\n```",
+                "description": f"```text\n{preview}\n```",
                 "color": 15158332 if not flights.empty else 9807270,
                 "fields": [
                     {
@@ -980,13 +1258,15 @@ def send_discord_report(
                         "inline": False,
                     },
                     {
-                        "name": "Załącznik",
+                        "name": "Raport",
                         "value": f"`{report_path.name}`",
                         "inline": False,
                     },
                 ],
                 "footer": {
-                    "text": "Publiczne ADS-B/MLAT • filtr granic Polski"
+                    "text": (
+                        "Publiczne ADS-B/MLAT • filtr granic Polski • trasy oznaczone poziomem pewności"
+                    )
                 },
                 "timestamp": datetime.now(UTC).isoformat(),
             }
@@ -1010,13 +1290,13 @@ def send_discord_report(
                 )
 
             if response.status_code == 429 or response.status_code >= 500:
-                wait_seconds = RETRY_WAIT_SECONDS * attempt
+                wait = RETRY_WAIT_SECONDS * attempt
                 log.warning(
-                    "Discord HTTP %s; ponowienie za %s s.",
+                    "Discord HTTP %s, ponowienie za %s s.",
                     response.status_code,
-                    wait_seconds,
+                    wait,
                 )
-                time.sleep(wait_seconds)
+                time.sleep(wait)
                 continue
 
             response.raise_for_status()
@@ -1025,22 +1305,22 @@ def send_discord_report(
 
         except requests.RequestException as exc:
             if attempt == MAX_RETRIES:
-                log.error("Discord: błąd po %s próbach: %s", attempt, exc)
+                log.error("Discord: wysyłka nieudana: %s", exc)
                 return False
 
-            wait_seconds = RETRY_WAIT_SECONDS * attempt
+            wait = RETRY_WAIT_SECONDS * attempt
             log.warning(
-                "Discord: błąd %s; ponowienie za %s s.",
+                "Discord: błąd %s, ponowienie za %s s.",
                 exc,
-                wait_seconds,
+                wait,
             )
-            time.sleep(wait_seconds)
+            time.sleep(wait)
 
     return False
 
 
 # =============================================================================
-# Główna procedura
+# Główne wykonanie
 # =============================================================================
 
 def generate_pending_reports(
@@ -1048,8 +1328,7 @@ def generate_pending_reports(
     session: requests.Session,
     now_lt: datetime,
 ) -> int:
-    """Tworzy brakujące raporty w zasięgu BACKFILL_HOURS."""
-    generated_count = 0
+    generated = 0
 
     for start_lt, end_lt in pending_report_hours(connection, now_lt):
         observations = get_hour_observations(
@@ -1062,6 +1341,8 @@ def generate_pending_reports(
             observations=observations,
             start_lt=start_lt,
             end_lt=end_lt,
+            connection=connection,
+            session=session,
         )
 
         report_path = save_report(content, start_lt)
@@ -1083,17 +1364,17 @@ def generate_pending_reports(
             discord_sent=discord_sent,
         )
 
-        generated_count += 1
+        generated += 1
 
         log.info(
-            "Raport: %s | loty: %s | próbki: %s | Discord: %s.",
-            report_path,
+            "Raport %s | loty=%s | próbki=%s | Discord=%s.",
+            report_path.name,
             flights_count,
             len(observations),
             "wysłano" if discord_sent else "nie wysłano",
         )
 
-    return generated_count
+    return generated
 
 
 def main() -> int:
@@ -1106,9 +1387,10 @@ def main() -> int:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
     log.info(
-        "Start: %s | API: %s",
+        "Start %s | ADSB=%s | route_lookup=%s",
         now_lt.strftime("%Y-%m-%d %H:%M:%S %Z"),
         ADSB_API_URL,
+        ENABLE_ROUTE_LOOKUP,
     )
 
     with sqlite3.connect(DATABASE_PATH) as connection:
@@ -1116,7 +1398,7 @@ def main() -> int:
         session = create_session()
 
         try:
-            aircraft = fetch_snapshot(session)
+            aircraft = fetch_adsb_snapshot(session)
             stats = save_snapshot(
                 connection=connection,
                 aircraft_list=aircraft,
@@ -1124,21 +1406,19 @@ def main() -> int:
             )
 
             log.info(
-                "Snapshot: globalnie=%s | Polska=%s | zapisano=%s | poza_PL=%s | stare=%s | błędne=%s.",
+                "Snapshot globalnie=%s | Polska=%s | zapisano=%s | poza_PL=%s | stare=%s | błędne=%s.",
                 stats["global"],
                 stats["inside_poland"],
                 stats["inserted"],
-                stats["outside_poland"],
+                stats["outside"],
                 stats["stale"],
                 stats["invalid"],
             )
 
         except Exception as exc:
-            # Kontynuujemy: raporty zaległe mogą zostać stworzone
-            # na podstawie danych wcześniej zapisanych w SQLite.
-            log.exception("Snapshot: błąd pobrania/zapisu: %s", exc)
+            log.exception("Snapshot: błąd pobierania/zapisu: %s", exc)
 
-        reports_created = generate_pending_reports(
+        report_count = generate_pending_reports(
             connection=connection,
             session=session,
             now_lt=now_lt,
@@ -1146,7 +1426,7 @@ def main() -> int:
 
         delete_old_data(connection)
 
-        log.info("Koniec: utworzono raportów: %s.", reports_created)
+        log.info("Koniec: wygenerowano raportów=%s.", report_count)
 
     return 0
 
