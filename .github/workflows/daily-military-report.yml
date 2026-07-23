@@ -2,15 +2,20 @@ name: Live Military Flight Collector
 
 on:
   schedule:
-    # Co 5 minut, według czasu polskiego (CET/CEST).
+    # Co 5 minut w czasie polskim, również po zmianie CET/CEST.
     - cron: "*/5 * * * *"
       timezone: "Europe/Warsaw"
 
-  # Pozwala uruchomić workflow ręcznie z zakładki Actions.
   workflow_dispatch:
     inputs:
       force_report:
-        description: "Wymuś stworzenie raportu za poprzednią pełną godzinę"
+        description: "Wymuś utworzenie raportu za ostatnią zamkniętą godzinę"
+        required: false
+        default: false
+        type: boolean
+
+      route_lookup:
+        description: "Włącz lookup prawdopodobnej trasy dla tego uruchomienia"
         required: false
         default: false
         type: boolean
@@ -19,34 +24,51 @@ permissions:
   contents: write
 
 concurrency:
-  # Nie pozwala, aby dwa runy jednocześnie zapisywały SQLite i robiły git push.
+  # SQLite i commit do main mogą wykonywać się tylko w jednym runie.
   group: live-military-flight-collector
   cancel-in-progress: false
 
 jobs:
   collect-and-report:
-    name: Collect ADS-B and generate hourly report
+    name: Collect ADS-B and publish report
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     env:
       TZ: Europe/Warsaw
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
 
-      # Baza SQLite i raporty będą commitowane do repozytorium.
+      # Źródło publicznych danych wojskowych.
+      ADSB_API_URL: https://api.adsb.lol/v2/mil
+
+      # Dane utrwalane w repozytorium.
       DATABASE_PATH: data/military_flights.sqlite3
       REPORTS_DIR: reports/hourly
 
-      # Poprawny endpoint: globalna lista oznaczonych obiektów wojskowych.
-      # Skrypt filtruje potem wyłącznie pozycje nad Polską.
-      ADSB_API_URL: https://api.adsb.lol/v2/mil
+      # Jakość danych: raportuj pozycje nie starsze niż 2 minuty.
+      MAX_SEEN_SECONDS: "120"
+      MIN_ALTITUDE_FT: "0"
+      MIN_SAMPLES_PER_FLIGHT: "1"
 
-      # Opcjonalne powiadomienia Discord.
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      # Maksymalnie jedna poprzednia zakończona godzina do nadrobienia.
+      # Chroni przed dużą liczbą pustych raportów po nowej instalacji.
+      BACKFILL_HOURS: "1"
 
-      # Przechowuj obserwacje maks. 14 dni.
+      # Utrzymanie danych.
       RETENTION_DAYS: "14"
 
-      # Przy ręcznym uruchomieniu można wymusić raport.
+      # Discord wysyła tylko raporty, w których wykryto lot.
+      DISCORD_SEND_EMPTY: "0"
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      # Trasa jest opcjonalna i zawsze oznaczana jako „prawdopodobna”.
+      # Domyślnie wyłączona — można aktywować ręcznie przy dispatch.
+      ENABLE_ROUTE_LOOKUP: ${{ github.event_name == 'workflow_dispatch' && inputs.route_lookup && '1' || '0' }}
+      ROUTE_CACHE_HOURS: "12"
+      ADSBDB_ROUTE_URL_TEMPLATE: https://api.adsbdb.com/v0/callsign/{callsign}
+
+      # Zostawione dla kompatybilności z ewentualnym trybem force w skrypcie.
       FORCE_REPORT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_report && '1' || '0' }}
 
     steps:
@@ -54,6 +76,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -65,37 +88,71 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
 
-      - name: Collect ADS-B snapshot and create hourly report
+      - name: Verify project files
+        run: |
+          test -f live_military_collector.py
+          test -f requirements.txt
+          python --version
+          python -m py_compile live_military_collector.py
+
+      - name: Collect ADS-B and generate reports
         run: |
           python live_military_collector.py
 
-      - name: Show generated files
+      - name: Show report diagnostics
         if: always()
         run: |
-          echo "=== SQLite database ==="
-          ls -lh data/ || true
+          echo "=== SQLite ==="
+          ls -lh data/ 2>/dev/null || true
 
           echo "=== Latest reports ==="
           ls -lht reports/hourly/ 2>/dev/null | head -n 15 || true
 
+          echo "=== Latest report preview ==="
+          LATEST_REPORT="$(ls -t reports/hourly/*.md 2>/dev/null | head -n 1 || true)"
+          if [ -n "${LATEST_REPORT}" ]; then
+            echo "File: ${LATEST_REPORT}"
+            sed -n '1,80p' "${LATEST_REPORT}"
+          else
+            echo "No report exists yet."
+          fi
+
       - name: Commit database and reports
         if: success()
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add data/military_flights.sqlite3 reports/hourly/
+          mkdir -p data reports/hourly
+
+          git add \
+            data/military_flights.sqlite3 \
+            reports/hourly/
 
           if git diff --cached --quiet; then
             echo "Brak zmian do zapisania."
             exit 0
           fi
 
-          git commit -m "chore: collect ADS-B snapshot $(TZ=Europe/Warsaw date '+%F %H:%M LT')"
+          git commit -m "chore: collect ADS-B $(TZ=Europe/Warsaw date '+%F %H:%M LT')"
 
-          # Chroni przed konfliktem, jeżeli branch otrzymał nowy commit.
-          git pull --rebase origin "${{ github.ref_name }}"
+          # Jeśli inny commit pojawił się podczas działania workflow,
+          # aktualizujemy branch i próbujemy ponownie wypchnąć zmiany.
+          for attempt in 1 2 3; do
+            if git pull --rebase origin "${BRANCH_NAME}" && git push origin "HEAD:${BRANCH_NAME}"; then
+              echo "Zmiany wypchnięte poprawnie."
+              exit 0
+            fi
 
-          git push
+            echo "Próba push ${attempt}/3 nieudana. Oczekiwanie..."
+            sleep $((attempt * 5))
+          done
+
+          echo "Nie udało się wypchnąć zmian po 3 próbach."
+          exit 1
